@@ -1,183 +1,164 @@
 # Yangon TV — Stream Server 1
 
-A single-instance Node.js service for **Bot 1 only**. It uses a user-authorized Telegram MTProto session to read video messages from one private storage channel, caches them in Cloudflare R2, and serves playback/downloads from `https://stream-server-1.ygntv.org`.
+A single-instance Node.js service for **Bot 1 only**. It accepts video/document uploads in a Telegram bot's private chat, forwards them to one private storage channel, caches them in Cloudflare R2 on first playback, and serves signed playback/download links at `https://stream-server-1.ygntv.org`.
 
-This repository does **not** implement Bots 2–5, multi-account support, round-robin, load balancing, or Laravel integration.
+Telegram intake, message forwarding, storage-channel access, and bot replies all use **MTProto via Teleproto**. The BotFather token is used only as the MTProto bot authorization credential; the code does not call Telegram's HTTP Bot API. Bots 2–5, multi-account load balancing, and Laravel integration are out of scope.
 
-## 1. Overview and architecture
+## Architecture
 
 ```text
-Private Telegram storage channel (master copy)
-                 │ Telegram MTProto / Teleproto
-                 ▼
-       Node.js 22 + Fastify backend
-                 │ chunked multipart upload (cache miss)
-                 ▼
-       Cloudflare R2 (cache/delivery)
-                 │ range-aware reads
-                 ▼
- stream-server-1.ygntv.org → browser/player
+Allowlisted user sends a video/document in a private Telegram chat
+                      │
+                      ▼
+       Teleproto bot account (MTProto updates)
+                      │ MTProto forwardMessages
+                      ▼
+       Private Telegram storage channel (master)
+                      │
+           Teleproto user account (MTProto)
+                      │ on first URL request: 512 KiB chunks
+                      ▼
+       Node.js 22 + Fastify → Cloudflare R2
+                                  │ range reads
+                                  ▼
+                     Cloudflare CDN / domain
+                                  │
+                      signed URL to the user
 ```
 
-The Telegram channel remains the master. R2 is the delivery cache. File registration stores a random UUID in a local SQLite catalog; public endpoints accept only that UUID, not arbitrary Telegram chat/message identifiers. Message IDs are only read from the configured storage channel.
+The bot returns the link through its MTProto connection. Media bytes are not downloaded to the web server during the upload/forwarding step. The existing streaming service later reads the channel file with MTProto, streams bounded chunks into R2, and serves byte ranges from R2. Files larger than 50 MB therefore do not rely on Telegram Bot API `getFile` downloads or a full-file RAM buffer.
 
-The backend is a conventional long-running Node.js process because it needs persistent MTProto authorization and reliable, long-lived, chunked source ingest. The public domain should terminate TLS at a reverse proxy/Cloudflare and forward to this backend. A Worker can be added later for edge routing or R2 delivery without moving MTProto ingest into it.
+## Telegram MTProto setup
 
-## 2. MTProto and Teleproto
+The service uses two Teleproto MTProto clients:
 
-The server uses **Teleproto**, the actively maintained successor to GramJS, which implements Telegram MTProto and keeps a GramJS-compatible API. It is a user-account MTProto client, not a Telegram Bot API file-download implementation. `TelegramMTProtoService` owns connection, authorization, private-channel resolution, message lookup, document metadata, and chunk iteration. HTTP routes do not contain MTProto logic.
+- A **user account** uses `TELEGRAM_SESSION` to read the private channel and download files in chunks.
+- A **bot account** uses the BotFather token as Teleproto's `botAuthToken` for MTProto bot authorization. It receives private incoming messages over a persistent MTProto connection, forwards media to the private storage channel, and replies with the signed URL. It does not use HTTP webhooks or Bot API polling.
 
-The service uses the provided `TELEGRAM_SESSION` as a persistent `StringSession`. Startup uses `connect()` and verifies authorization; it does not call an interactive login flow and will not prompt on restart. An absent/expired session is reported as an MTProto error.
+Telegram documents bot authorization through [`auth.importBotAuthorization`](https://core.telegram.org/api/bots). Teleproto documents [bot-token authentication](https://docs.teleproto.dev/authentication), [incoming message events](https://docs.teleproto.dev/guides/events), and persistent [sessions](https://docs.teleproto.dev/sessions). Telegram's [`messages.forwardMessages`](https://core.telegram.org/method/messages.forwardMessages) method is available to both users and bots.
 
-- Get `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` from [my.telegram.org/apps](https://my.telegram.org/apps). Treat the hash as a secret.
-- Create a user StringSession with Teleproto's [authorization guide](https://docs.teleproto.dev/) on a secure, one-time operator workstation. Complete the normal Telegram login/2FA flow there, copy the resulting session directly into a secret manager, and do not paste it into source control, tickets, chat, or shell history. Never run session provisioning in the web server process.
-- The Telegram user account must be a member of the private storage channel and able to read its video messages.
-- Provide the channel's ID in `TELEGRAM_STORAGE_CHAT_ID`. The app resolves and checks access at startup/diagnostics.
+Requirements:
 
-The implementation never serializes or logs the session. Session strings and `.session` files are ignored by Git.
+1. Obtain `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` at [my.telegram.org/apps](https://my.telegram.org/apps). Keep the hash secret.
+2. Create the bot with [@BotFather](https://t.me/BotFather) and put its token in the deployment secret manager as `TELEGRAM_BOT_TOKEN`. Do not paste the token into chat or commit it.
+3. Add the bot account as an administrator of `TELEGRAM_STORAGE_CHAT_ID` with permission to post messages. The user account holding `TELEGRAM_SESSION` must be able to read that channel.
+4. Set `TELEGRAM_BOT_ALLOWED_USER_IDS` to comma-separated numeric Telegram user IDs. An empty value **denies all uploads** (fail-closed). Only allowlisted users can receive links. The bot accepts files in private chats, not group uploads.
+5. Keep the directory configured by `TELEGRAM_BOT_SESSION_PATH` on persistent writable storage. Teleproto's `StoreSession` stores the bot's MTProto auth key there; protect it like a password. The default is `./data/telegram-bot-session`.
 
-## 3. Cloudflare R2 setup
+The existing user session is a persistent Teleproto `StringSession`. Provision it securely on an operator workstation using Teleproto's authorization flow, store it directly in a secret manager, and never log or commit it. Neither client prompts for interactive login during server startup.
 
-Create one R2 bucket for this instance and an R2 API token with only the bucket/object permissions the service needs (read, write, list/head, and delete for the chosen bucket). Supply:
+## Cloudflare R2 setup
+
+Create one R2 bucket for this instance and an API token limited to the bucket/object permissions the service needs. Supply:
 
 - `CF_ACCOUNT_ID`
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
 - `R2_BUCKET_NAME`
 
-`CloudflareR2Storage` uses the AWS SDK S3-compatible endpoint at `https://<account-id>.r2.cloudflarestorage.com`. The stable key is `videos/{internal-uuid}.mp4`. Uploads use an S3-compatible multipart uploader with an 8 MiB part size and a queue size of 2, avoiding whole-file RAM buffers. Playback reads return Node streams and pass through byte ranges to R2.
+`CloudflareR2Storage` uses the AWS SDK S3-compatible endpoint at `https://<account-id>.r2.cloudflarestorage.com`. Objects use stable keys `videos/{internal-uuid}.mp4`. Uploads use an S3-compatible multipart uploader with 8 MiB parts and a queue size of 2; playback uses Node streams and forwards byte ranges. Confirm the maximum expected file size, account/storage limits, bandwidth, and Telegram limits before production. See [Cloudflare R2 limits](https://developers.cloudflare.com/r2/platform/limits/).
 
-R2 supports objects up to 5 TiB and multipart uploads up to 4.995 TiB (10,000 parts), subject to the current [R2 limits](https://developers.cloudflare.com/r2/platform/limits/). Confirm the intended max video size, available disk/database storage, bandwidth, and Telegram account limits before production.
+## Environment configuration
 
-## 4. Environment variables
-
-Copy `.env.example` to `.env`, fill it locally, and use a platform secret manager in production. `.env` is git-ignored. Do not expose these values to browsers or logs.
+Copy `.env.example` to `.env` for local use and use a platform secret manager in production. `.env`, the `data/` directory, SQLite files, and session state are git-ignored.
 
 | Variable | Purpose |
 | --- | --- |
 | `APP_ENV` | `development`, `test`, or `production` |
-| `APP_URL` | Public base URL; production value is `https://stream-server-1.ygntv.org` |
+| `APP_URL` | Public base URL; production: `https://stream-server-1.ygntv.org` |
 | `HOST`, `PORT` | Bind interface and service port |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Telegram MTProto application credentials |
-| `TELEGRAM_SESSION` | Persistent authorized Teleproto StringSession |
-| `TELEGRAM_STORAGE_CHAT_ID` | The single private master channel for this instance |
-| `CF_ACCOUNT_ID` | Cloudflare account identifier for the S3-compatible endpoint |
-| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | R2 S3 API credentials |
-| `R2_BUCKET_NAME` | This instance's cache bucket |
+| `TELEGRAM_SESSION` | Authorized user-account Teleproto StringSession |
+| `TELEGRAM_STORAGE_CHAT_ID` | The single private master channel |
+| `TELEGRAM_BOT_TOKEN` | BotFather token, used only for Teleproto MTProto bot authorization |
+| `TELEGRAM_BOT_SESSION_PATH` | Persistent bot MTProto session directory; default `./data/telegram-bot-session` |
+| `TELEGRAM_BOT_ALLOWED_USER_IDS` | Comma-separated numeric user IDs; empty means deny all |
+| `CF_ACCOUNT_ID` | Cloudflare account identifier |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | R2 S3-compatible credentials |
+| `R2_BUCKET_NAME` | Cache bucket |
 | `STREAM_TOKEN_SECRET` | Random secret of at least 32 characters for HMAC-signed URLs |
-| `MANAGEMENT_API_TOKEN` | Random bearer token (at least 24 characters) for management/diagnostic endpoints |
+| `MANAGEMENT_API_TOKEN` | Random bearer token (at least 24 characters) for management/diagnostics |
 | `DATABASE_PATH` | Persistent SQLite catalog path; default `./data/catalog.sqlite` |
 | `LOG_LEVEL` | Pino log level; default `info` |
 
-Generate independent secrets with a cryptographically secure random generator (for example `openssl rand -hex 32`). Use a different management bearer token and signing secret. Store all credentials in the hosting platform's secret manager; rotate them if exposed.
+Generate independent secrets with a cryptographically secure random generator (for example `openssl rand -hex 32`). Do not reuse the bot token, signing secret, or management token. Rotate credentials if exposed.
 
-## 5. Local development
+## Local development and build
 
 Requires Node.js 22+ and npm.
 
 ```bash
 cp .env.example .env
-# Set the secrets/IDs above; for health-only local startup, the external credentials may remain blank.
 npm ci
-npm run dev
+npm run check
+npm test
+npm run build
+npm start
 ```
 
-The local server starts on `0.0.0.0:3000` by default. With credentials omitted, `/health` still works, while MTProto/R2-dependent operations return safe errors. Add valid external credentials and a persistent session to exercise Telegram and R2.
+With external credentials omitted, `/health` still works and Telegram/R2-dependent features stay unavailable. The upload bot starts only when the user MTProto session, storage channel, R2, bot token, and signing secret are configured. A blank allowlist leaves uploads denied.
 
-Commands:
+## Production deployment
 
-```bash
-npm run check   # strict TypeScript type check
-npm test        # unit/API tests using in-memory fakes; no external credentials required
-npm run build   # compile to dist/
-npm start       # run compiled server
-```
+1. Deploy as a persistent Node.js 22 process/container with outbound access to Telegram MTProto and Cloudflare R2. Keep the service running; this is not a short-lived Worker workload.
+2. Set secrets in the host's secret manager. Persist both the directory at `TELEGRAM_BOT_SESSION_PATH` and the SQLite database path (by default, both live under `./data`).
+3. Terminate TLS at Cloudflare or a reverse proxy and route `stream-server-1.ygntv.org` to the backend. Expose `GET /health` for load-balancer checks. Ensure proxies preserve `Range`, `Content-Range`, and streaming responses without buffering or short timeouts.
+4. Check `/api/diagnostics` with the management bearer token. Verify the user account can read the channel, the bot account can post there, R2 is reachable, and the allowlist contains the intended users.
+5. Test with one allowlisted account, first a small clip and then a representative file over 50 MB. Seek into the large file and monitor process memory, R2 multipart cleanup, network use, and proxy timeouts.
 
-A SQLite catalog needs persistent writable storage. For containers, mount a durable volume at the chosen `DATABASE_PATH` location.
+Production secrets, live Telegram/R2 access, DNS, webhook setup, and deployment are **not** modified by the code build itself. No webhook is required for the MTProto bot.
 
-## 6. Production deployment and domain
+## Playback and management API
 
-1. Deploy on a persistent Node.js 22 host/container with outbound network connectivity to Telegram MTProto and Cloudflare R2's S3 endpoint. Provide enough memory for the Node runtime plus bounded multipart buffers; do not impose short request timeouts on cache-miss ingest.
-2. Configure all secrets through the deployment secret manager. Set `APP_ENV=production`, `APP_URL=https://stream-server-1.ygntv.org`, and a durable SQLite path/volume.
-3. Terminate HTTPS at Cloudflare or a reverse proxy and route `stream-server-1.ygntv.org` to the backend. Permit `GET /health` for load balancer health checks. Set proxy/read timeouts for large downloads, and ensure proxies preserve `Range`, `If-Range`, `Content-Range`, and streaming response bodies.
-4. Restrict `/api/*` management paths at the network layer where practical in addition to bearer authentication. Keep R2 credentials limited to the one bucket.
-5. Check `/api/diagnostics` using the management bearer token before opening public traffic. Verify the backend can reach Telegram and the private channel and can head the R2 bucket.
-6. Use a persistent volume and backup/monitor the SQLite catalog. The R2 object cache can be repopulated from Telegram, but catalog UUID-to-message mappings are required to identify media.
-
-The app listens on `HOST`/`PORT` and exposes `/health` for probes. The included Dockerfile compiles the TypeScript app and runs as a non-root user; configure runtime env/secrets and a persistent data mount outside the image.
-
-## 7. API, playback, and downloads
-
-### Public endpoints
+Public routes:
 
 - `GET /health` → `{ "status": "ok" }`
-- `GET /file/{id}` → inline video playback
-- `GET /download/{id}` → attachment download, preserving the Telegram filename when available
+- `GET /file/{id}` → inline playback
+- `GET /download/{id}` → attachment download
 - `GET /v/{token}` → inline playback using an expiring signed token
 
-### Authenticated management endpoints
+Authenticated management routes use `Authorization: Bearer $MANAGEMENT_API_TOKEN`:
 
-Send `Authorization: Bearer $MANAGEMENT_API_TOKEN`:
+- `POST /api/files` with `{ "messageId": "123" }` registers a message already in the configured private channel and returns an opaque UUID plus a one-hour signed URL.
+- `GET /api/files/{id}` returns safe metadata and a fresh signed URL.
+- `DELETE /api/files/{id}` deletes its R2 cache object and catalog mapping, but does not delete the Telegram master message.
+- `GET /api/diagnostics` checks application, user MTProto connection, storage-channel access, and R2 without disclosing credentials.
 
-- `POST /api/files` with JSON `{ "messageId": "123" }`: inspect that message in the configured private channel and register an opaque UUID. Re-registering the same Telegram message returns the existing mapping.
-- `GET /api/files/{id}`: return public-safe file metadata and a one-hour signed playback URL.
-- `DELETE /api/files/{id}`: delete its R2 cache object and catalog mapping. This does not delete the master Telegram message.
-- `GET /api/diagnostics`: checks application, MTProto connection, storage-channel access, and R2 without disclosing credentials.
+Signed tokens contain a versioned UUID/expiry payload and an HMAC-SHA-256 signature. They are bearer links: anyone who receives a link can use it until its one-hour expiry. Invalid or expired tokens return `403`.
 
-Example:
+## Large-file behavior and cache
 
-```bash
-curl -H "Authorization: Bearer $MANAGEMENT_API_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"messageId":"123"}' \
-  https://stream-server-1.ygntv.org/api/files
-```
+The MTProto bot forwards the Telegram message into the channel; it does not retrieve bytes using the Bot API. On the first URL request, the user-account MTProto client fetches the document and iterates 512 KiB chunks directly into an R2 multipart upload. The server does not buffer a whole video in memory or create a full temporary copy. Subsequent requests use R2 while the object remains cached. A per-process single-flight map de-duplicates simultaneous cache misses; it is not a distributed lock, so multi-replica deployments need a shared lock.
 
-A signed token contains a versioned UUID/expiry payload and an HMAC-SHA-256 signature. It is not a Telegram ID. Invalid or expired tokens return `403`. Tokens expire after one hour by default. Signed responses are `private, no-store` to reduce token leakage through shared caches.
+`GET /file/{id}` and `/download/{id}` support single byte ranges, including bounded, open-ended, and suffix ranges. Valid ranges return `206 Partial Content` with `Accept-Ranges`, `Content-Length`, `Content-Range`, `Content-Type`, and `ETag`; unsatisfiable ranges return `416` with `Content-Range: bytes */{size}`. Multiple ranges are not implemented. Browser video controls can play, seek, and resume using byte ranges.
 
-## 8. Cache and large-file handling
+## Security and reliability
 
-On the first request, the service validates the UUID, checks R2, fetches the configured Telegram message using MTProto if the object is absent, streams Telegram chunks (512 KiB requests) into an R2 multipart upload, then serves from R2. Subsequent requests do not fetch Telegram again while the object remains cached. A per-process single-flight map de-duplicates simultaneous misses for the same UUID. This is not a distributed lock; multiple backend replicas require a shared lock if duplicate cross-process downloads become a concern.
+- The bot handles private incoming MTProto messages and checks the allowlist before forwarding any media. Empty allowlist means deny all.
+- A new SQLite table records bot message processing state using source chat/message IDs, preventing duplicate channel copies on retries after a partial failure. Table creation is additive; existing file catalog records are unchanged.
+- `.env`, Telegram user/bot sessions, SQLite files, `node_modules`, and build output are excluded from Git/Docker contexts as configured.
+- Management authentication uses constant-time bearer comparison. Public routes accept registered UUIDs only; signed tokens are HMAC-protected and expire.
+- Logs do not contain bot tokens, session strings, URL tokens, or secret values. Use TLS, least-privilege R2 credentials, a protected management token, and persistent encrypted secret storage.
 
-The initial cache-miss request waits for Telegram-to-R2 ingest to finish before playback begins, by design. It does not buffer the complete video in RAM or create a temporary video copy. R2 uploads use bounded multipart concurrency; R2 playback uses a stream. Ensure the hosting platform/reverse proxy supports long-lived streamed HTTP responses and does not buffer them to disk.
+## Cloudflare Worker note
 
-`GET /file/{id}` and `/download/{id}` support single HTTP byte ranges, including bounded, open-ended, and suffix ranges. For valid ranges, the service returns `206 Partial Content` with `Accept-Ranges`, `Content-Length`, `Content-Range`, `Content-Type`, and `ETag`. Unsatisfiable ranges return `416` with `Content-Range: bytes */{size}`. Multiple ranges are not implemented. Standard browser video controls can play, pause, seek, and resume through these requests.
+A Worker may be added later for edge routing or R2 delivery, but it is not used for Telegram ingest. Keep MTProto and the large-file chunk-to-R2 path in the persistent Node backend; any edge layer should receive a separate end-to-end range/auth/cache/large-file soak test.
 
-## 9. Cloudflare Worker feasibility
+## Troubleshooting
 
-A Worker is suitable as an optional edge layer for routing, short-lived token validation, cache policy, and R2-bound delivery. It is **not used for Telegram origin ingest in this implementation**. A persistent Node backend is a better fit for the MTProto client/session and large Telegram chunk-to-R2 multipart stream; it can operate independently of a browser request-body limit.
-
-Cloudflare's current [Workers limits](https://developers.cloudflare.com/workers/platform/limits/) list 128 MiB memory, plan-dependent CPU limits (10 ms Free, 5 min Paid by default), and HTTP request-body limits based on Cloudflare zone plan (100 MB Free/Pro, 200 MB Business, up to 5 GB Enterprise). The response body is not hard-limited, and Workers can stream responses, but resource and client-disconnect behavior still need to be considered. R2 itself supports multipart uploads, including through Workers, but that does not remove MTProto session/runtime integration constraints. Keep the origin ingest on Node; use a Worker only after a separate end-to-end range, auth, caching, and large-file soak test.
-
-## 10. Security and logging
-
-- `.env`, MTProto session files, SQLite files, `node_modules`, and build output are ignored.
-- Never commit Telegram/R2 credentials, signing/admin secrets, a session string, private keys, or production database contents.
-- Management routes and diagnostics use constant-time bearer comparison. Public video routes address only registered UUIDs; signed tokens use HMAC and expiry.
-- Pino structured request logs include request ID, route template, file UUID (where applicable), status, latency, and whether a range was requested. Cache HIT/MISS is logged. Auth headers, URL token values, and secret values are not logged.
-- Use TLS, least-privilege R2 keys, a protected admin token, and encrypted secret storage. Apply rate limits/IP controls at the edge for management endpoints.
-
-## 11. Troubleshooting
-
-| Symptom | Likely cause / action |
+| Symptom | Likely action |
 | --- | --- |
-| `/health` succeeds, diagnostics show Telegram false | Verify API ID/hash, authorized persistent session, outbound connectivity, and that the session has not been revoked. No interactive login occurs on server restart. |
-| Telegram connection works but storage access fails | Confirm the authenticated account belongs to `TELEGRAM_STORAGE_CHAT_ID`, the ID is correct, and the channel has not restricted access. |
-| Registration returns 404 | The message ID may not exist in the configured private channel or may not contain document media. |
-| Playback misses then returns 502 | Telegram source fetch failed; inspect sanitized request logs and test a small video/message. |
-| R2 diagnostics false or request returns 503 | Verify account ID, endpoint, bucket name, token permissions, and host egress to R2. |
-| 416 response | The requested byte range is outside the object size or malformed. Retry with a valid single range. |
-| Seeking fails behind a proxy | Ensure the proxy forwards the `Range` header and does not buffer/truncate streamed responses. |
-| Signed URL returns 403 | The token expired, was altered, the signing secret changed, or the URL was copied incompletely. Request a new management URL. |
-| SQLite errors after restart | Persist and back up the volume containing `DATABASE_PATH`; ephemeral container storage loses the UUID map. |
+| `/health` works but diagnostics report Telegram false | Check API ID/hash, authorized user StringSession, outbound access, and session revocation. |
+| Bot does not start | Check BotFather token, API credentials, user session, R2/signing configuration, channel ID, and persistent writable bot-session path. |
+| Bot upload is denied | Add the sender's numeric Telegram user ID to `TELEGRAM_BOT_ALLOWED_USER_IDS`; empty means deny all. |
+| Bot cannot forward into storage channel | Make the bot an admin with post permission; ensure the private message is not protected from forwarding. |
+| Playback fails after a cache miss | Check user MTProto channel access, R2 credentials, and host egress. Inspect sanitized logs and try a small clip. |
+| `416` or seeking fails | Check the requested range and confirm the reverse proxy preserves Range/Content-Range headers without buffering. |
+| SQLite catalog disappears after restart | Persist and back up the volume containing `DATABASE_PATH`. Also persist the bot session directory. |
 
-## 12. Tests and production readiness
+## Tests and project structure
 
-The test suite covers health and diagnostic authorization, authenticated registration and Telegram-message metadata flow, R2 cache hit/miss, Telegram-to-R2 caching, range streaming, attachment download, signed/expired/invalid tokens, 404, and Telegram/R2 error mapping. The tests use local in-memory adapters; they do not contact Telegram or Cloudflare.
-
-Before production traffic, provision real Telegram and R2 secrets, verify the private channel from the service account, register and play a small test clip, then test a representative large file and seek from the middle while monitoring memory, process restarts, proxy timeouts, and R2 multipart cleanup. This live integration/large-file test cannot be completed without the operator's credentials, channel message, and deployed infrastructure.
-
-## 13. Project structure
+The tests use in-memory fakes and do not contact Telegram or Cloudflare. They cover API auth, file registration, R2 cache hit/miss, range streaming, signed URLs, Telegram/R2 failure mapping, MTProto bot authorization, allowlist enforcement, forwarding, update deduplication, and retry after a partial failure. A live large-file test still requires real Telegram/R2 credentials and deployed infrastructure.
 
 ```text
 src/
@@ -188,9 +169,9 @@ src/
 ├── services/
 │   ├── file-catalog.ts
 │   ├── types.ts
-│   ├── telegram/telegram-mtproto-service.ts
+│   ├── telegram/{telegram-mtproto-service,telegram-mtproto-bot-service}.ts
 │   └── r2/{r2-storage-service,types}.ts
 ├── streaming/{cache-coordinator,range}.ts
 └── utils/errors.ts
-tests/{app,range}.test.ts
+tests/{app,range,telegram-mtproto-bot}.test.ts
 ```

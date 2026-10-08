@@ -13,6 +13,7 @@ RUN groupadd --system app && useradd --system --gid app app
 COPY --from=build --chown=app:app /app/package*.json ./
 COPY --from=build --chown=app:app /app/node_modules ./node_modules
 COPY --from=build --chown=app:app /app/dist ./dist
+RUN mkdir -p /app/data && chown app:app /app/data
 USER app
 EXPOSE 3000
 CMD ["node", "dist/index.js"]

@@ -18,6 +18,18 @@ export interface TelegramFileMetadata {
   documentId: string | null;
 }
 
+export type BotUpdateClaim =
+  | { kind: 'acquired'; leaseToken: string; copiedMessageId?: number }
+  | { kind: 'busy' }
+  | { kind: 'completed'; status: 'completed' | 'rejected'; fileId?: string };
+
+export interface BotUpdateStore {
+  claim(sourceChatId: string, sourceMessageId: number): BotUpdateClaim;
+  recordCopy(sourceChatId: string, sourceMessageId: number, leaseToken: string, copiedMessageId: number): void;
+  complete(sourceChatId: string, sourceMessageId: number, leaseToken: string, outcome: 'completed' | 'rejected', fileId?: string): void;
+  release(sourceChatId: string, sourceMessageId: number, leaseToken: string): void;
+}
+
 export interface FileCatalog {
   get(id: string): FileRecord | undefined;
   findByMessage(messageId: string): FileRecord | undefined;
